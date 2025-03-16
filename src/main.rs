@@ -1,17 +1,17 @@
 use std::{fs, io::{Read, Write}, net::{Shutdown, TcpListener, TcpStream}};
 
+use regru::replace_record;
+mod regru;
+
 macro_rules! RESPONSE {
 	($data:expr) => {format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}", $data.len(), $data)};
 }
 
-struct AuthConfig {
-	host: String,
-	pass: String,
-}
-
 struct Config {
 	port: u16,
-	auth: AuthConfig,
+	key: String,
+	username: String,
+	password: String,
 }
 
 struct Socket {
@@ -45,42 +45,40 @@ impl Socket {
 
 fn read_config() -> Result<Config, String> {
 	let mut port: Option<u16> = None;
-	let mut host: Option<&str> = None;
-	let mut pass: Option<&str> = None;
+	let mut key: Option<&str> = None;
+	let mut username: Option<&str> = None;
+	let mut password: Option<&str> = None;
 
 	let content = fs::read_to_string("config.txt").map_err(|e| format!("Ошибка чтения файла: {}", e))?;
 
 	for line in content.lines() {
 		let line = line.trim();
-		if line.is_empty() || line.starts_with('#') {
-			continue;
-		}
+		if line.is_empty() || line.starts_with('#') {continue}
 
 		let mut parts = line.splitn(2, '=');
-		let key = parts.next()
+		let name = parts.next()
 			.ok_or_else(|| format!("Некорректный формат строки: {}", line))?;
 		let value = parts.next()
 			.ok_or_else(|| format!("Некорректный формат строки: {}", line))?
 			.trim_matches('"')
 			.trim();
 
-		match key.trim() {
+		match name.trim() {
 			"port" => {
-				port = Some(value.parse::<u16>()
-					.map_err(|e| format!("Некорректный порт: {}", e))?); // Исправлено здесь
+				port = Some(value.parse::<u16>().map_err(|e| format!("Некорректный порт: {}", e))?);
 			}
-			"host" => host = Some(value),
-			"pass" => pass = Some(value),
+			"key" => key = Some(value),
+			"username" => username = Some(value),
+			"password" => password = Some(value),
 			other => return Err(format!("Неизвестный параметр: {}", other)),
 		}
 	}
 
 	Ok(Config {
 		port: port.ok_or("Порт не указан")?,
-		auth: AuthConfig {
-			host: host.ok_or("Хост не указан")?.to_string(),
-			pass: pass.ok_or("Пароль не указан")?.to_string(),
-		},
+		key: key.ok_or("Ключ не указан")?.to_string(),
+		username: username.ok_or("Логин не указан")?.to_string(),
+		password: password.ok_or("Пароль не указан")?.to_string(),
 	})
 }
 
@@ -104,12 +102,10 @@ fn process(config: &Config, socket: &Socket, addr: String) -> Option<(String, St
 		}
 	}
 
-	let mut header_host: Option<&str> = None;
 	let mut header_auth: Option<&str> = None;
 	for header in http_parts {
 		let (name, value) = header.split_once(": ")?;
 		match name {
-			"Host" => header_host = Some(value),
 			"Authorization" => {
 				let (_, x) = value.split_once(" ")?;
 				header_auth = Some(x);
@@ -119,8 +115,7 @@ fn process(config: &Config, socket: &Socket, addr: String) -> Option<(String, St
 	}
 
 	if ip? != sip {println!("запрещено обновлять другой хост"); return None}
-	if header_host? != config.auth.host {println!("хост отличается"); return None}
-	if header_auth? != config.auth.pass {
+	if header_auth? != config.key {
 		println!("неверный пароль");
 		socket.send(RESPONSE!("badauth").as_bytes());
 		return None
@@ -144,14 +139,16 @@ fn listen(config: &Config) -> Result<(), String> {
 		match process(config, &socket, addr.to_string()) {
 			Some((domain, ip)) => {
 				socket.send(RESPONSE!(format!("good {}", ip)).as_bytes());
-				println!("{domain} -> {ip}")
+				println!("{domain} -> {ip}");
+				match replace_record(&config, domain, ip) {
+					Err(v) => println!("Ошибка регистратора: {v}"), Ok(_) => println!("Запись обновлена")
+				}
 			}, None => {},
 		};
 		
 		socket.close();
 	}
 }
-
 
 
 fn main() {
