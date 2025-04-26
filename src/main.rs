@@ -1,162 +1,139 @@
-use std::{fs, io::{Read, Write}, net::{Shutdown, TcpListener, TcpStream}};
+use std::{
+    error::Error,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    path::PathBuf,
+    sync::Arc,
+    thread,
+};
 
+use config::Config;
 use regru::replace_record;
+
+mod config;
 mod regru;
 
 macro_rules! RESPONSE {
-	($data:expr) => {format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}", $data.len(), $data)};
+    ($data:expr) => {
+        format!(
+            "HTTP/1.1 200 OK\r
+Content-Type: text/plain\r
+Content-Length: {}\r
+\r
+{}",
+            $data.len(),
+            $data
+        )
+    };
 }
 
-struct Config {
-	port: u16,
-	key: String,
-	username: String,
-	password: String,
+fn read_request(text: &str) -> Option<(String, String, String)> {
+    let (http_parts, _) = text.split_once("\r\n\r\n")?;
+    let mut http_parts = http_parts.split("\r\n");
+
+    let http_line = http_parts.next()?;
+    let (_, query) = http_line.split_once("?")?;
+    let mut domain: Option<&str> = None;
+    let mut ip: Option<&str> = None;
+    for q in query.split('&') {
+        let (name, value) = q.split_once('=')?;
+        match name {
+            "hostname" => domain = Some(value),
+            "myip" => ip = Some(value),
+            _ => continue,
+        }
+    }
+
+    let mut header_auth: Option<&str> = None;
+    for header in http_parts {
+        let (name, value) = header.split_once(": ")?;
+        match name {
+            "Authorization" => {
+                let (_, x) = value.split_once(" ")?;
+                header_auth = Some(x);
+            }
+            _ => continue,
+        }
+    }
+
+    Some((
+        ip?.to_string(),
+        header_auth?.to_string(),
+        domain?.to_string(),
+    ))
 }
 
-struct Socket {
-	stream: TcpStream,
+/// stream, config -> (domain, ip)
+fn process(mut stream: TcpStream, config: Arc<Config>) -> Result<(), Box<dyn Error>> {
+    let sip = stream.peer_addr()?.ip().to_string();
+
+    println!("Подключение: {}", &sip);
+
+    let mut buf = vec![0; 1024];
+    let buf_len = stream.read(&mut buf)?;
+    buf.truncate(buf_len);
+
+    let text = String::from_utf8(buf)?;
+
+    let (ip, header_auth, domain) =
+        read_request(&text).ok_or::<Box<dyn Error>>("ошибка запроса".into())?;
+
+    if ip != sip {
+        return Err("запрещено обновлять другой хост".into());
+    }
+
+    if header_auth != config.key {
+        let _ = stream.write_all(RESPONSE!("badauth").as_bytes());
+        return Err("неверный пароль".into());
+    }
+
+    stream.write_all(RESPONSE!(format!("good {}", ip)).as_bytes())?;
+
+    println!("{domain} -> {ip}");
+
+    match replace_record(&config.username, &config.password, &domain, &ip) {
+        Err(v) => println!("Ошибка регистратора: {v}"),
+        Ok(_) => println!("Запись обновлена"),
+    }
+
+    Ok(())
 }
 
-impl Socket {
-	pub fn new(stream: TcpStream) -> Self {
-		Socket {stream}
-	}
+fn listen(config: Arc<Config>) -> Result<(), Box<dyn Error>> {
+    let bind_addr = format!("0.0.0.0:{}", config.port);
 
-	pub fn recv(&self) -> Option<String> {
-		let mut stream = &self.stream;
-		let mut buf: [u8; 1024] = [0; 1024];
-		let n = stream.read(&mut buf).ok()?;
-		Some(String::from_utf8_lossy(&buf[..n]).to_string())
-	}
+    println!("Запуск DDNS сервера на {bind_addr}");
 
-	pub fn send(&self, data: &[u8]) {
-		let mut stream = &self.stream;
-		stream.write_all(data).ok();
-	}
+    let listener = TcpListener::bind(&bind_addr).map_err(|e| format!("{}", e))?;
 
-	pub fn close(&self) {
-		let stream = &self.stream;
-		stream.shutdown(Shutdown::Both).ok();
-	}
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+
+        let config = config.clone();
+
+        thread::spawn(move || {
+            match process(stream, config) {
+                Ok(_) => {}
+                Err(e) => {
+                    println!("error: {}", e);
+                }
+            };
+        });
+    }
+
+    Ok(())
 }
-
-
-
-fn read_config() -> Result<Config, String> {
-	let mut port: Option<u16> = None;
-	let mut key: Option<&str> = None;
-	let mut username: Option<&str> = None;
-	let mut password: Option<&str> = None;
-
-	let content = fs::read_to_string("config.txt").map_err(|e| format!("Ошибка чтения файла: {}", e))?;
-
-	for line in content.lines() {
-		let line = line.trim();
-		if line.is_empty() || line.starts_with('#') {continue}
-
-		let mut parts = line.splitn(2, '=');
-		let name = parts.next()
-			.ok_or_else(|| format!("Некорректный формат строки: {}", line))?;
-		let value = parts.next()
-			.ok_or_else(|| format!("Некорректный формат строки: {}", line))?
-			.trim_matches('"')
-			.trim();
-
-		match name.trim() {
-			"port" => {
-				port = Some(value.parse::<u16>().map_err(|e| format!("Некорректный порт: {}", e))?);
-			}
-			"key" => key = Some(value),
-			"username" => username = Some(value),
-			"password" => password = Some(value),
-			other => return Err(format!("Неизвестный параметр: {}", other)),
-		}
-	}
-
-	Ok(Config {
-		port: port.ok_or("Порт не указан")?,
-		key: key.ok_or("Ключ не указан")?.to_string(),
-		username: username.ok_or("Логин не указан")?.to_string(),
-		password: password.ok_or("Пароль не указан")?.to_string(),
-	})
-}
-
-
-
-fn process(config: &Config, socket: &Socket, addr: String) -> Option<(String, String)> {
-	let (sip, _) = addr.split_once(":")?;
-
-	let text = socket.recv()?;
-	let (http_parts, _) = text.split_once("\r\n\r\n")?;
-	let mut http_parts = http_parts.split("\r\n");
-	
-	let http_line = http_parts.next()?;
-	let (_, query) = http_line.split_once("?")?;
-	let mut domain: Option<&str> = None;
-	let mut ip: Option<&str> = None;
-	for q in query.split('&') {
-		let (name, value) = q.split_once('=')?;
-		match name {
-			"hostname" => domain = Some(value), "myip" => ip = Some(value), _ => continue,
-		}
-	}
-
-	let mut header_auth: Option<&str> = None;
-	for header in http_parts {
-		let (name, value) = header.split_once(": ")?;
-		match name {
-			"Authorization" => {
-				let (_, x) = value.split_once(" ")?;
-				header_auth = Some(x);
-			},
-			_ => continue,
-		}
-	}
-
-	if ip? != sip {println!("запрещено обновлять другой хост"); return None}
-	if header_auth? != config.key {
-		println!("неверный пароль");
-		socket.send(RESPONSE!("badauth").as_bytes());
-		return None
-	}
-
-	Some((domain?.to_string(), ip?.to_string()))
-}
-
-
-
-fn listen(config: &Config) -> Result<(), String> {
-	let bind_addr = "0.0.0.0:".to_string() + &config.port.to_string();
-	println!("Запуск DDNS сервера на {bind_addr}");
-	let listener = TcpListener::bind(&bind_addr).map_err(|e| format!("{}", e))?;
-	loop {
-		let (socket, addr) = match listener.accept() {
-			Ok((stream, addr)) => (Socket::new(stream), addr), Err(_) => continue,
-		};
-		println!("Подключение: {addr}");
-
-		match process(config, &socket, addr.to_string()) {
-			Some((domain, ip)) => {
-				socket.send(RESPONSE!(format!("good {}", ip)).as_bytes());
-				println!("{domain} -> {ip}");
-				match replace_record(&config, domain, ip) {
-					Err(v) => println!("Ошибка регистратора: {v}"), Ok(_) => println!("Запись обновлена")
-				}
-			}, None => {},
-		};
-		
-		socket.close();
-	}
-}
-
 
 fn main() {
-	let config = read_config().unwrap_or_else(|e| {
-		println!("Ошибка конфига: {e}"); std::process::exit(0);
-	});
+    let config = Config::from_file(&PathBuf::from("config.yml")).unwrap_or_else(|e| {
+        println!("Ошибка конфига: {e}");
+        std::process::exit(0);
+    });
 
-	let _ = listen(&config).unwrap_or_else(|e| {
-		println!("Ошибка слушателя: {e}")
-	});
+    match listen(Arc::new(config)) {
+        Ok(_) => {}
+        Err(e) => {
+            println!("Ошибка слушателя: {e}")
+        }
+    };
 }
